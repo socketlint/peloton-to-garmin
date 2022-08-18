@@ -16,6 +16,7 @@ namespace Peloton
 		Task<RecentWorkouts> GetWorkoutsAsync(int numWorkouts, int page);
 		Task<JObject> GetWorkoutByIdAsync(string id);
 		Task<JObject> GetWorkoutSamplesByIdAsync(string id);
+		Task<UserData> GetUserDataAsync();
 	}
 
 	public class ApiClient : IPelotonApi
@@ -49,6 +50,12 @@ namespace Peloton
 		{
 			if (!string.IsNullOrEmpty(UserId) && !string.IsNullOrEmpty(SessionId))
 				return;
+
+			if (string.IsNullOrEmpty(_userEmail))
+				throw new ArgumentException("Peloton email is not set and is required.");
+
+			if (string.IsNullOrEmpty(_userPassword))
+				throw new ArgumentException("Peloton password is not set and is required.");
 
 			try
 			{
@@ -117,6 +124,13 @@ namespace Peloton
 				};
 			})
 			.GetJsonAsync<RecentWorkouts>();
+		}
+
+		public Task<UserData> GetUserDataAsync()
+		{
+			return $"{BaseUrl}/me"
+			.WithCookie("peloton_session_id", SessionId)
+			.GetJsonAsync<UserData>();
 		}
 
 		public Task<JObject> GetWorkoutByIdAsync(string id)

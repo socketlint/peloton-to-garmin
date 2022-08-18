@@ -73,13 +73,13 @@ namespace Conversion
 
 		public abstract ConvertStatus Convert(P2GWorkout workoutData);
 
-		protected abstract T Convert(Workout workout, WorkoutSamples workoutSamples);
+		protected abstract T Convert(Workout workout, WorkoutSamples workoutSamples, UserData userData);
 
 		protected abstract void Save(T data, string path);
 
 		protected abstract void SaveLocalCopy(string sourcePath, string workoutTitle);
 
-		protected ConvertStatus Convert(FileFormat format, P2GWorkout workoutData)
+		protected ConvertStatus ConvertForFormat(FileFormat format, P2GWorkout workoutData)
 		{
 			using var tracing = Tracing.Trace($"{nameof(IConverter)}.{nameof(Convert)}.Workout")?
 										.WithWorkoutId(workoutData.Workout.Id)
@@ -92,7 +92,7 @@ namespace Conversion
 			var workoutTitle = WorkoutHelper.GetUniqueTitle(workoutData.Workout);
 			try
 			{
-				converted = Convert(workoutData.Workout, workoutData.WorkoutSamples);
+				converted = Convert(workoutData.Workout, workoutData.WorkoutSamples, workoutData.UserData);
 			}
 			catch (Exception e)
 			{
@@ -193,7 +193,6 @@ namespace Conversion
 				case DistanceUnit.Feet:
 					return (float)value * 0.3048f;
 				default:
-					Log.Verbose("Found unkown distance unit {@Unit}", unit);
 					return (float)value;
 			}
 		}
@@ -498,13 +497,42 @@ namespace Conversion
 				case "km":
 					return DistanceUnit.Kilometers;
 				case "mi":
+				case "mph":
 					return DistanceUnit.Miles;
 				case "ft":
 					return DistanceUnit.Feet;
 				default:
-					Log.Verbose("Found unkown distance unit {@Unit}", unit);
+					Log.Error("Found unknown distance unit {@Unit}", unit);
 					return DistanceUnit.Unknown;
 			}
+		}
+
+		protected ushort? GetCyclingFtp(Workout workout, UserData userData)
+		{
+			ushort? ftp = null;
+			if (workout?.Ftp_Info is object && workout.Ftp_Info.Ftp > 0)
+			{
+				ftp = workout.Ftp_Info.Ftp;
+
+				if (workout.Ftp_Info.Ftp_Source == CyclingFtpSource.Ftp_Manual_Source)
+					ftp = (ushort)Math.Round(ftp.GetValueOrDefault() * .95);
+			} 
+			
+			if (ftp is null || ftp <= 0)
+			{
+				if (userData?.Cycling_Ftp_Source == CyclingFtpSource.Ftp_Manual_Source)
+					ftp = (ushort)Math.Round(userData.Cycling_Ftp * .95);
+
+				if (userData?.Cycling_Ftp_Source == CyclingFtpSource.Ftp_Workout_Source)
+					ftp = userData.Cycling_Workout_Ftp;
+			}
+
+			if (ftp is null || ftp <= 0)
+			{
+				ftp = userData?.Estimated_Cycling_Ftp;
+			}
+
+			return ftp;
 		}
 	}
 }
