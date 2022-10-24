@@ -3,7 +3,8 @@
     "OutputDirectory": "./output",
     "EnablePolling": true,
     "PollingIntervalSeconds": 86400,
-    "CloseWindowOnFinish": false
+    "CloseWindowOnFinish": false,
+    "CheckForUpdates": true
   },
 
   "Format": {
@@ -46,7 +47,13 @@
 
     "Serilog": {
       "Using": [ "Serilog.Sinks.Console", "Serilog.Sinks.File" ],
-      "MinimumLevel": "Information",
+      "MinimumLevel": {
+        "Default": "Information",
+        "Override": {
+          "Microsoft": "Error",
+          "System": "Error"
+        }
+      },
       "WriteTo": [
         { "Name": "Console" },
         {

@@ -1,19 +1,21 @@
-﻿using Common;
-using Common.Dto.Peloton;
+﻿using Common.Dto.Peloton;
+using Common.Http;
 using Common.Observe;
+using Common.Service;
+using Common.Stateful;
 using Flurl.Http;
 using Newtonsoft.Json.Linq;
 using Peloton.Dto;
 using Serilog;
 using System;
+using System.Net;
 using System.Threading.Tasks;
 
 namespace Peloton
 {
 	public interface IPelotonApi
 	{
-		Task InitAuthAsync(string overrideUserAgent = null);
-		Task<RecentWorkouts> GetWorkoutsAsync(int numWorkouts, int page);
+		Task<PagedPelotonResponse<Workout>> GetWorkoutsAsync(int pageSize, int page);
 		Task<JObject> GetWorkoutByIdAsync(string id);
 		Task<JObject> GetWorkoutSamplesByIdAsync(string id);
 		Task<UserData> GetUserDataAsync();
@@ -25,183 +27,127 @@ namespace Peloton
 		private static readonly string BaseUrl = "https://api.onepeloton.com/api";
 		private static readonly string AuthBaseUrl = "https://api.onepeloton.com/auth/login";
 
-		private readonly string _userEmail;
-		private readonly string _userPassword;
-		private readonly bool _observabilityEnabled;
+		private readonly ISettingsService _settingsService;
 
-		private string UserId;
-		private string SessionId;
-
-		public ApiClient(Settings config, AppConfiguration appConfig)
+		public ApiClient(ISettingsService settingsService)
 		{
-			_userEmail = config.Peloton.Email;
-			_userPassword = config.Peloton.Password;
-			_observabilityEnabled = appConfig.Observability.Prometheus.Enabled;
+			_settingsService = settingsService;
 		}
 
-		public ApiClient(string email, string password, bool observabilityEnabled)
+		public async Task<PelotonApiAuthentication> GetAuthAsync(string overrideUserAgent = null)
 		{
-			_userEmail = email;
-			_userPassword = password;
-			_observabilityEnabled = observabilityEnabled;
-		}
+			var settings = await _settingsService.GetSettingsAsync();
 
-		public async Task InitAuthAsync(string overrideUserAgent = null)
-		{
-			if (!string.IsNullOrEmpty(UserId) && !string.IsNullOrEmpty(SessionId))
-				return;
+			settings.Peloton.EnsurePelotonCredentialsAreProvided();
 
-			if (string.IsNullOrEmpty(_userEmail))
-				throw new ArgumentException("Peloton email is not set and is required.");
+			var auth = _settingsService.GetPelotonApiAuthentication(settings.Peloton.Email);
+			if (auth is object && auth.IsValid(settings))
+				return auth;
 
-			if (string.IsNullOrEmpty(_userPassword))
-				throw new ArgumentException("Peloton password is not set and is required.");
+			auth = new();
+			auth.Email = settings.Peloton.Email;
+			auth.Password = settings.Peloton.Password;
 
 			try
 			{
 				var response = await $"{AuthBaseUrl}"
 				.WithHeader("Accept-Language", "en-US")
 				.WithHeader("User-Agent", overrideUserAgent ?? "PostmanRuntime/7.26.10")
-				.ConfigureRequest((c) =>
-				{
-					c.BeforeCallAsync = null;
-					c.BeforeCallAsync = (FlurlCall call) =>
-					{
-						_logger.Verbose("HTTP Request: {@HttpMethod} - {@Uri} - {@Headers} - {@Content}", call.HttpRequestMessage.Method, call.HttpRequestMessage.RequestUri, call.HttpRequestMessage.Headers.ToString(),"userAuthParams");
-						return Task.CompletedTask;
-					};
-				})
+				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.PostJsonAsync(new AuthRequest()
 				{
-					username_or_email = _userEmail,
-					password = _userPassword
+					username_or_email = auth.Email,
+					password = auth.Password
 				})
 				.ReceiveJson<AuthResponse>();
 
-				UserId = response.user_id;
-				SessionId = response.session_id;
-			} catch(Exception e)
+				auth.UserId = response.user_id;
+				auth.SessionId = response.session_id;
+
+				_settingsService.SetPelotonApiAuthentication(auth);
+				return auth;
+			}
+			catch (FlurlHttpException fe) when (fe.StatusCode == (int)HttpStatusCode.Unauthorized)
 			{
-				_logger.Fatal(e, "Failed to authenticate with Peloton. Email: {@Email}", _userEmail);
-				throw new PelotonAuthenticationError("Failed to authenticate with Peloton", e);
+				_logger.Error(fe, $"Failed to authenticate with Peloton.");
+				_settingsService.ClearPelotonApiAuthentication(auth.Email);
+				throw new PelotonAuthenticationError("Failed to authenticate with Peloton. Please confirm your Peloton Email and Password are correct.", fe);
+			}
+			catch (Exception e)
+			{
+				_logger.Fatal(e, $"Failed to authenticate with Peloton.");
+				_settingsService.ClearPelotonApiAuthentication(auth.Email);
+				throw;
 			}
 		}
 
-		public Task<RecentWorkouts> GetWorkoutsAsync(int numWorkouts, int page)
+		public async Task<PagedPelotonResponse<Workout>> GetWorkoutsAsync(int pageSize, int page)
 		{
-			return $"{BaseUrl}/user/{UserId}/workouts"
-			.WithCookie("peloton_session_id", SessionId)
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/user/{auth.UserId}/workouts"
+			.WithCookie("peloton_session_id", auth.SessionId)
+			.SetQueryParams(new
+			{
+				limit = pageSize,
+				sort_by = "-created",
+				page = page,
+				joins= "ride"
+			})
+			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
+			.GetJsonAsync<PagedPelotonResponse<Workout>>();
+		}
+
+		/// <summary>
+		/// For ad hoc testing.
+		/// </summary>
+		public async Task<JObject> GetWorkoutsAsync(string userId, int numWorkouts, int page)
+		{
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/user/{userId}/workouts"
+			.WithCookie("peloton_session_id", auth.SessionId)
 			.SetQueryParams(new
 			{
 				limit = numWorkouts,
 				sort_by = "-created",
 				page = page,
-				joins= "ride"
+				joins = "ride"
 			})
-			.ConfigureRequest((c) => 
-			{
-				c.AfterCallAsync = async (FlurlCall call) => 
-				{
-					_logger.Verbose("HTTP Response: {@HttpStatusCode} - {@HttpMethod} - {@Uri} - {@Headers} - {@Content}", 
-								call.HttpResponseMessage?.StatusCode, 
-								call.HttpRequestMessage?.Method, 
-								call.HttpRequestMessage?.RequestUri, 
-								call.HttpResponseMessage.Headers.ToString(), 
-								await call.HttpResponseMessage?.Content.ReadAsStringAsync());
-
-					if (_observabilityEnabled)
-					{
-						FlurlConfiguration.HttpRequestHistogram
-						.WithLabels(
-							call.HttpRequestMessage.Method.ToString(),
-							call.HttpRequestMessage.RequestUri.Host,
-							"/user/{userid}/workouts",
-							"?limit={limit}&sort_by={sortby}",
-							((int)call.HttpResponseMessage.StatusCode).ToString(),
-							call.HttpResponseMessage.ReasonPhrase
-						).Observe(call.Duration.GetValueOrDefault().TotalSeconds);
-					}
-				};
-			})
-			.GetJsonAsync<RecentWorkouts>();
+			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
+			.GetJsonAsync<JObject>();
 		}
 
-		public Task<UserData> GetUserDataAsync()
+		public async Task<UserData> GetUserDataAsync()
 		{
-			return $"{BaseUrl}/me"
-			.WithCookie("peloton_session_id", SessionId)
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/me"
+			.WithCookie("peloton_session_id", auth.SessionId)
+			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 			.GetJsonAsync<UserData>();
 		}
 
-		public Task<JObject> GetWorkoutByIdAsync(string id)
+		public async Task<JObject> GetWorkoutByIdAsync(string id)
 		{
-			return $"{BaseUrl}/workout/{id}"
-				.WithCookie("peloton_session_id", SessionId)
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/workout/{id}"
+				.WithCookie("peloton_session_id", auth.SessionId)
 				.SetQueryParams(new
 				{
 					joins = "ride,ride.instructor"
 				})
-				.ConfigureRequest((c) =>
-				{
-					c.AfterCallAsync = async (FlurlCall call) =>
-					{
-						_logger.Verbose("HTTP Response: {@HttpStatusCode} - {@HttpMethod} - {@Uri} - {@Headers} - {@Content}",
-								call.HttpResponseMessage?.StatusCode,
-								call.HttpRequestMessage?.Method,
-								call.HttpRequestMessage?.RequestUri,
-								call.HttpResponseMessage.Headers.ToString(),
-								await call.HttpResponseMessage?.Content.ReadAsStringAsync());
-
-						if (_observabilityEnabled)
-						{
-							FlurlConfiguration.HttpRequestHistogram
-							.WithLabels(
-								call.HttpRequestMessage.Method.ToString(),
-								call.HttpRequestMessage.RequestUri.Host,
-								"/workout/{workoutid}",
-								"?joins={joins}",
-								((int)call.HttpResponseMessage.StatusCode).ToString(),
-								call.HttpResponseMessage.ReasonPhrase
-							).Observe(call.Duration.GetValueOrDefault().TotalSeconds);
-						}
-					};
-				})
+				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<JObject>();
 		}
 
-		public Task<JObject> GetWorkoutSamplesByIdAsync(string id)
+		public async Task<JObject> GetWorkoutSamplesByIdAsync(string id)
 		{
-			return $"{BaseUrl}/workout/{id}/performance_graph"
-				.WithCookie("peloton_session_id", SessionId)
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/workout/{id}/performance_graph"
+				.WithCookie("peloton_session_id", auth.SessionId)
 				.SetQueryParams(new
 				{
 					every_n=1
 				})
-				.ConfigureRequest((c) =>
-				{
-					c.AfterCallAsync = async (FlurlCall call) =>
-					{
-						_logger.Verbose("HTTP Response: {@HttpStatusCode} - {@HttpMethod} - {@Uri} - {@Headers} - {@Content}",
-								call.HttpResponseMessage?.StatusCode,
-								call.HttpRequestMessage?.Method,
-								call.HttpRequestMessage?.RequestUri,
-								call.HttpResponseMessage.Headers.ToString(),
-								await call.HttpResponseMessage?.Content.ReadAsStringAsync());
-
-						if (_observabilityEnabled)
-						{
-							FlurlConfiguration.HttpRequestHistogram
-							.WithLabels(
-								call.HttpRequestMessage.Method.ToString(),
-								call.HttpRequestMessage.RequestUri.Host,
-								"/workout/{workoutid}/performance_graph",
-								"?every_n={everyn}&joins=effort_zones",
-								((int)call.HttpResponseMessage.StatusCode).ToString(),
-								call.HttpResponseMessage.ReasonPhrase
-							).Observe(call.Duration.GetValueOrDefault().TotalSeconds);
-						}
-					};
-				})
+				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<JObject>();
 		}
 	}

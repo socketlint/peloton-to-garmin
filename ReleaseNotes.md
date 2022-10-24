@@ -1,11 +1,6 @@
-
-## New Features
-
-- [#298] WebUI - Add configuration support to modify the host and port both the API and WebUI bind to
+[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/philosowaffle) <span class="badge-buymeacoffee"><a href="https://www.buymeacoffee.com/philosowaffle" title="Donate to this project using Buy Me A Coffee"><img src="https://img.shields.io/badge/buy%20me%20a%20coffee-donate-yellow.svg" alt="Buy Me A Coffee donate button" /></a></span>
+---
 
 ## Fixes
 
-- [#292] WebUI - Fixing `Failed to get settings from db` error message on fresh install
-- [#296] Docs site fixes
-- [#295] WebUI - Fix documentation link on settings page was incorrect
-- [#294] WebUI - Do not try to fetch data from Peloton if Email or Password is missing 
+- [#354] Console application failed to convert workout with error: `KeyNotFoundException`

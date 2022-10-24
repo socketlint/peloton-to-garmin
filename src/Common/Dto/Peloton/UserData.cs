@@ -9,7 +9,7 @@ public class UserData
 	/// When Source == Ftp_Manual_Source then use Cycling_Ftp
 	/// </summary>
 	[JsonConverter(typeof(JsonStringEnumConverter))]
-	public CyclingFtpSource Cycling_Ftp_Source { get; set; }
+	public CyclingFtpSource? Cycling_Ftp_Source { get; set; }
 	/// <summary>
 	/// Actual FTP generated from a workout
 	/// </summary>
@@ -35,5 +35,6 @@ public enum CyclingFtpSource
 {
 	Unknown = 0,
 	Ftp_Workout_Source = 1,
-	Ftp_Manual_Source = 2
+	Ftp_Manual_Source = 2,
+	Ftp_Estimated_Source = 3
 }
