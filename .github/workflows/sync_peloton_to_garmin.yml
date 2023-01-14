@@ -8,9 +8,9 @@ on:
     inputs:
       workoutsToDownload:
         type: number
-        default: "5"
+        default: "2"
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 * * * *'
 
 jobs:
   sync:
