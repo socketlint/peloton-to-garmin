@@ -4,6 +4,7 @@ using Common.Dto.Garmin;
 using Common.Dto.Peloton;
 using Common.Helpers;
 using Common.Observe;
+using Common.Service;
 using Common.Stateful;
 using Dynastream.Fit;
 using Prometheus;
@@ -11,6 +12,7 @@ using Serilog;
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Metrics = Prometheus.Metrics;
 using Summary = Common.Dto.Peloton.Summary;
 
@@ -18,7 +20,7 @@ namespace Conversion
 {
 	public interface IConverter
 	{
-		ConvertStatus Convert(P2GWorkout workoutData);
+		Task<ConvertStatus> ConvertAsync(P2GWorkout workoutData);
 	}
 
 	public abstract class Converter<T> : IConverter
@@ -29,6 +31,21 @@ namespace Conversion
 		});
 
 		private static readonly ILogger _logger = LogContext.ForClass<Converter<T>>();
+
+		private static readonly GarminDeviceInfo RowingDevice = new GarminDeviceInfo()
+		{
+			Name = "Epix", // Max 20 Chars
+			ProductID = GarminProduct.EpixGen2,
+			UnitId = 3413684246,
+			ManufacturerId = 1, // Garmin
+			Version = new GarminDeviceVersion()
+			{
+				VersionMajor = 10,
+				VersionMinor = 43,
+				BuildMajor = 0,
+				BuildMinor = 0,
+			}
+		};
 
 		private static readonly GarminDeviceInfo CyclingDevice = new GarminDeviceInfo()
 		{
@@ -62,44 +79,51 @@ namespace Conversion
 
 		public static readonly float _metersPerMile = 1609.34f;
 
-		protected Settings _config;
-		protected IFileHandling _fileHandler;
+		public FileFormat Format { get; init; }
 
-		public Converter(Settings config, IFileHandling fileHandler)
+		protected readonly ISettingsService _settingsService;
+		protected readonly IFileHandling _fileHandler;
+
+		public Converter(ISettingsService settingsService, IFileHandling fileHandler)
 		{
-			_config = config;
+			_settingsService = settingsService;
 			_fileHandler = fileHandler;
 		}
 
-		public abstract ConvertStatus Convert(P2GWorkout workoutData);
+		protected abstract bool ShouldConvert(Format settings);
 
-		protected abstract T Convert(Workout workout, WorkoutSamples workoutSamples);
+		protected abstract Task<T> ConvertInternalAsync(P2GWorkout workoutData, Settings settings);
 
 		protected abstract void Save(T data, string path);
 
-		protected abstract void SaveLocalCopy(string sourcePath, string workoutTitle);
-
-		protected ConvertStatus Convert(FileFormat format, P2GWorkout workoutData)
+		public async Task<ConvertStatus> ConvertAsync(P2GWorkout workoutData)
 		{
-			using var tracing = Tracing.Trace($"{nameof(IConverter)}.{nameof(Convert)}.Workout")?
+			using var tracing = Tracing.Trace($"{nameof(IConverter)}.{nameof(ConvertAsync)}.Workout")?
 										.WithWorkoutId(workoutData.Workout.Id)
-										.WithTag(TagKey.Format, format.ToString());
+										.WithTag(TagKey.Format, Format.ToString());
 
 			var status = new ConvertStatus();
+			var settings = await _settingsService.GetSettingsAsync();
+
+			if (!ShouldConvert(settings.Format))
+			{
+				status.Result = ConversionResult.Skipped;
+				return status;
+			}
 
 			// call internal convert method
 			T converted = default;
 			var workoutTitle = WorkoutHelper.GetUniqueTitle(workoutData.Workout);
 			try
 			{
-				converted = Convert(workoutData.Workout, workoutData.WorkoutSamples);
+				converted = await ConvertInternalAsync(workoutData, settings);
 			}
 			catch (Exception e)
 			{
-				_logger.Error(e, "Failed to convert workout data to format {@Format} {@Workout}", format, workoutTitle);
-				status.Success = false;
-				status.ErrorMessage = "Failed to convert workout data.";
-				tracing?.AddTag("excetpion.message", e.Message);
+				_logger.Error(e, "Failed to convert workout data to format {@Format} {@Workout}", Format, workoutTitle);
+				status.Result = ConversionResult.Failed;
+				status.ErrorMessage = $"Unknown error while trying to convert workout data for {workoutTitle} - {e.Message}";
+				tracing?.AddTag("exception.message", e.Message);
 				tracing?.AddTag("exception.stacktrace", e.StackTrace);
 				tracing?.AddTag("convert.success", false);
 				tracing?.AddTag("convert.errormessage", status.ErrorMessage);
@@ -107,18 +131,18 @@ namespace Conversion
 			}
 
 			// write to output dir
-			var path = Path.Join(_config.App.WorkingDirectory, $"{workoutTitle}.{format}");
+			var path = Path.Join(settings.App.WorkingDirectory, $"{workoutTitle}.{Format}");
 			try
 			{
-				_fileHandler.MkDirIfNotExists(_config.App.WorkingDirectory);
+				_fileHandler.MkDirIfNotExists(settings.App.WorkingDirectory);
 				Save(converted, path);
-				status.Success = true;
+				status.Result = ConversionResult.Success;
 			}
 			catch (Exception e)
 			{
-				status.Success = false;
-				status.ErrorMessage = "Failed to save converted workout for upload.";
-				_logger.Error(e, "Failed to write {@Format} file for {@Workout}", format, workoutTitle);
+				status.Result = ConversionResult.Failed;
+				status.ErrorMessage = $"Failed to save converted workout {workoutTitle} for upload. - {e.Message}";
+				_logger.Error(e, "Failed to write {@Format} file for {@Workout}", Format, workoutTitle);
 				tracing?.AddTag("excetpion.message", e.Message);
 				tracing?.AddTag("exception.stacktrace", e.StackTrace);
 				tracing?.AddTag("convert.success", false);
@@ -127,30 +151,24 @@ namespace Conversion
 			}
 
 			// copy to local save
-			try
-			{
-				SaveLocalCopy(path, workoutTitle);
-			}
-			catch (Exception e)
-			{
-				_logger.Error(e, "Failed to backup {@Format} file for {@Workout}", format, workoutTitle);
-			}
+			if (settings.Format.SaveLocalCopy)
+				CopyToLocalSaveDir(path, workoutTitle, settings);
 
 			// copy to upload dir
-			if (_config.Garmin.Upload && _config.Garmin.FormatToUpload == format)
+			if (settings.Garmin.Upload && settings.Garmin.FormatToUpload == Format)
 			{
 				try
 				{
-					var uploadDest = Path.Join(_config.App.UploadDirectory, $"{workoutTitle}.{format}");
-					_fileHandler.MkDirIfNotExists(_config.App.UploadDirectory);
+					var uploadDest = Path.Join(settings.App.UploadDirectory, $"{workoutTitle}.{Format.ToString().ToLower()}");
+					_fileHandler.MkDirIfNotExists(settings.App.UploadDirectory);
 					_fileHandler.Copy(path, uploadDest, overwrite: true);
-					_logger.Debug("Prepped {@Format} for upload: {@Path}", format, uploadDest);
+					_logger.Debug("Prepped {@Format} for upload: {@Path}", Format, uploadDest);
 				}
 				catch (Exception e)
 				{
-					_logger.Error(e, "Failed to copy {@Format} file for {@Workout}", format, workoutTitle);
-					status.Success = false;
-					status.ErrorMessage = $"Failed to save file for {@format} and workout {workoutTitle} to Upload directory";
+					_logger.Error(e, "Failed to copy {@Format} file for {@Workout}", Format, workoutTitle);
+					status.Result = ConversionResult.Failed;
+					status.ErrorMessage = $"Failed to save file for {Format} and workout {workoutTitle} to Upload directory - {e.Message}";
 					tracing?.AddTag("excetpion.message", e.Message);
 					tracing?.AddTag("exception.stacktrace", e.StackTrace);
 					tracing?.AddTag("convert.success", false);
@@ -162,6 +180,28 @@ namespace Conversion
 			return status;
 		}
 
+		protected void CopyToLocalSaveDir(string sourcePath, string workoutTitle, Settings settings)
+		{
+			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(CopyToLocalSaveDir)}")
+										.WithTag(TagKey.Format, FileFormat.Json.ToString());
+
+			var formatString = Format.ToString().ToLower();
+			var localSaveDir = Path.GetFullPath(Path.Join(settings.App.OutputDirectory, formatString));
+
+			try
+			{
+				_fileHandler.MkDirIfNotExists(localSaveDir);
+
+				var backupDest = Path.Join(localSaveDir, $"{workoutTitle}.{formatString}");
+				_fileHandler.Copy(sourcePath, backupDest, overwrite: true);
+				_logger.Information("[@Format] Backed up file {@File}", Format, backupDest);
+			}
+			catch (Exception e)
+			{
+				_logger.Error(e, "Failed to backup {@Format} file for {@Workout} to directory {@Path}", Format, workoutTitle, localSaveDir);
+			}
+		}
+
 		protected System.DateTime GetStartTimeUtc(Workout workout)
 		{
 			var startTimeInSeconds = workout.Start_Time;
@@ -169,9 +209,9 @@ namespace Conversion
 			return dateTime.UtcDateTime;
 		}
 
-		protected System.DateTime GetEndTimeUtc(Workout workout)
+		protected System.DateTime GetEndTimeUtc(Workout workout, WorkoutSamples workoutSamples)
 		{
-			var endTimeSeconds = workout.End_Time;
+			var endTimeSeconds = workout.End_Time ?? workoutSamples.Duration + workout.Start_Time;
 			var dateTime = DateTimeOffset.FromUnixTimeSeconds(endTimeSeconds);
 			return dateTime.UtcDateTime;
 		}
@@ -181,9 +221,9 @@ namespace Conversion
 			return startTime.AddSeconds(offset).ToString("yyyy-MM-ddTHH:mm:ssZ");
 		}
 
-		protected float ConvertDistanceToMeters(double value, string unit)
+		public static float ConvertDistanceToMeters(double value, string unit)
 		{
-			var distanceUnit = GetDistanceUnit(unit);
+			var distanceUnit = UnitHelpers.GetDistanceUnit(unit);
 			switch (distanceUnit)
 			{
 				case DistanceUnit.Kilometers:
@@ -192,13 +232,28 @@ namespace Conversion
 					return (float)value * _metersPerMile;
 				case DistanceUnit.Feet:
 					return (float)value * 0.3048f;
+				case DistanceUnit.FiveHundredMeters:
+					return (float)value / 500;
+				case DistanceUnit.Meters:
 				default:
-					Log.Verbose("Found unkown distance unit {@Unit}", unit);
 					return (float)value;
 			}
 		}
 
-		protected float GetTotalDistance(WorkoutSamples workoutSamples)
+		public static float ConvertWeightToKilograms(double value, string unit)
+		{
+			var weightUnit = UnitHelpers.GetWeightUnit(unit);
+			switch (weightUnit)
+			{
+				case WeightUnit.Pounds:
+					return (float)(value * 0.453592);
+				case WeightUnit.Kilograms:
+				default:
+					return (float)value;
+			}
+		}
+
+		public static float GetTotalDistance(WorkoutSamples workoutSamples)
 		{
 			var distanceSummary = GetDistanceSummary(workoutSamples);
 			if (distanceSummary is null) return 0.0f;
@@ -207,22 +262,32 @@ namespace Conversion
 			return ConvertDistanceToMeters(distanceSummary.Value.GetValueOrDefault(), unit);
 		}
 
-		protected float ConvertToMetersPerSecond(double? value, WorkoutSamples workoutSamples)
+		public static float ConvertToMetersPerSecond(double? value, string displayUnit)
 		{
-			var val = value.GetValueOrDefault();
+			float val = (float)value.GetValueOrDefault();
+			if (val <= 0) return 0.0f;
 
-			var distanceSummary = GetDistanceSummary(workoutSamples);
-			if (distanceSummary is null) return (float)val;
+			var unit = UnitHelpers.GetSpeedUnit(displayUnit);
 
-			var unit = distanceSummary.Display_Unit;
-			var metersPerHour = ConvertDistanceToMeters(val, unit);
-			var metersPerMinute = metersPerHour / 60;
-			var metersPerSecond = metersPerMinute / 60;
-
-			return metersPerSecond;
+			switch(unit)
+			{
+				case SpeedUnit.KilometersPerHour:
+				case SpeedUnit.MilesPerHour:
+					var meters = ConvertDistanceToMeters(val, displayUnit);
+					var metersPerMinute = meters / 60;
+					var metersPerSecond = metersPerMinute / 60;
+					return metersPerSecond;
+				case SpeedUnit.MinutesPer500Meters:
+					float secondsPer500m = val * 60f;
+					var mps = 500 / secondsPer500m;
+					return mps;
+				default:
+					Log.Error("Found unknown speed unit {@Unit}", unit);
+					return 0;
+			}
 		}
 
-		private Summary GetDistanceSummary(WorkoutSamples workoutSamples)
+		private static Summary GetDistanceSummary(WorkoutSamples workoutSamples)
 		{
 			if (workoutSamples?.Summaries is null)
 			{
@@ -238,7 +303,7 @@ namespace Conversion
 			return distanceSummary;
 		}
 
-		protected Summary GetCalorieSummary(WorkoutSamples workoutSamples)
+		public static Summary GetCalorieSummary(WorkoutSamples workoutSamples)
 		{
 			if (workoutSamples?.Summaries is null)
 			{
@@ -248,10 +313,16 @@ namespace Conversion
 
 			var summaries = workoutSamples.Summaries;
 			var caloriesSummary = summaries.FirstOrDefault(s => s.Slug == "calories");
-			if (caloriesSummary is null)
-				_logger.Verbose("No calories slug found.");
+			if (caloriesSummary is not null)
+				return caloriesSummary;
 
-			return caloriesSummary;
+			// calories may have been provided by Apple Watch
+			caloriesSummary = summaries.FirstOrDefault(s => s.Slug == "total_calories");
+			if (caloriesSummary is not null)
+				return caloriesSummary;
+
+			_logger.Verbose("No calories slug found.");
+			return null;
 		}
 
 		protected float GetMaxSpeedMetersPerSecond(WorkoutSamples workoutSamples)
@@ -260,7 +331,7 @@ namespace Conversion
 			if (speedSummary is null) return 0.0f;
 
 			var max = speedSummary.Max_Value.GetValueOrDefault();
-			return ConvertToMetersPerSecond(max, workoutSamples);
+			return ConvertToMetersPerSecond(max, speedSummary.Display_Unit);
 		}
 
 		protected float GetAvgSpeedMetersPerSecond(WorkoutSamples workoutSamples)
@@ -269,7 +340,7 @@ namespace Conversion
 			if (speedSummary is null) return 0.0f;
 
 			var avg = speedSummary.Average_Value.GetValueOrDefault();
-			return ConvertToMetersPerSecond(avg, workoutSamples);
+			return ConvertToMetersPerSecond(avg, speedSummary.Display_Unit);
 		}
 
 		protected float GetAvgGrade(WorkoutSamples workoutSamples)
@@ -294,7 +365,12 @@ namespace Conversion
 
 		protected Metric GetSpeedSummary(WorkoutSamples workoutSamples)
 		{
-			return GetMetric("speed", workoutSamples);
+			var speed = GetMetric("speed", workoutSamples);
+
+			if (speed is null)
+				speed = GetMetric("split_pace", workoutSamples);
+
+			return speed;
 		}
 
 		protected byte? GetUserMaxHeartRate(WorkoutSamples workoutSamples) 
@@ -441,9 +517,22 @@ namespace Conversion
 			return GetMetric("heart_rate", workoutSamples);
 		}
 
-		protected Metric GetCadenceSummary(WorkoutSamples workoutSamples)
+		protected static Metric GetCadenceSummary(WorkoutSamples workoutSamples, Sport sport)
 		{
+			if (sport == Sport.Rowing)
+				return GetMetric("stroke_rate", workoutSamples);
+
 			return GetMetric("cadence", workoutSamples);
+		}
+
+		public static GraphData GetCadenceTargets(WorkoutSamples workoutSamples)
+		{
+			var targets = workoutSamples.Target_Performance_Metrics?.Target_Graph_Metrics?.FirstOrDefault(w => w.Type == "cadence")?.Graph_Data;
+
+			if (targets is null)
+				targets = workoutSamples.Target_Performance_Metrics?.Target_Graph_Metrics?.FirstOrDefault(w => w.Type == "stroke_rate")?.Graph_Data;
+
+			return targets;
 		}
 
 		protected Metric GetResistanceSummary(WorkoutSamples workoutSamples)
@@ -451,7 +540,7 @@ namespace Conversion
 			return GetMetric("resistance", workoutSamples);
 		}
 
-		protected Metric GetMetric(string slug, WorkoutSamples workoutSamples)
+		protected static Metric GetMetric(string slug, WorkoutSamples workoutSamples)
 		{
 			if (workoutSamples?.Metrics is null)
 			{
@@ -474,36 +563,72 @@ namespace Conversion
 			return metric;
 		}
 
-		protected GarminDeviceInfo GetDeviceInfo(FitnessDiscipline sport)
+		protected async Task<GarminDeviceInfo> GetDeviceInfoAsync(FitnessDiscipline sport, Settings settings)
 		{
-			GarminDeviceInfo userProvidedDeviceInfo = null;
-			var userDevicePath = _config.Format.DeviceInfoPath;
+			GarminDeviceInfo userProvidedDeviceInfo = await _settingsService.GetCustomDeviceInfoAsync(settings.Garmin.Email);
 
-			if (!string.IsNullOrEmpty(userDevicePath))
-			{
-				if(_fileHandler.TryDeserializeXml(userDevicePath, out userProvidedDeviceInfo))
-					return userProvidedDeviceInfo;
-			}
+			if (userProvidedDeviceInfo is object) return userProvidedDeviceInfo;
 
 			if(sport == FitnessDiscipline.Cycling)
 				return CyclingDevice;
 
+			if (sport == FitnessDiscipline.Caesar)
+				return RowingDevice;
+
 			return DefaultDevice;
 		}
 
-		protected DistanceUnit GetDistanceUnit(string unit)
+		protected ushort? GetCyclingFtp(Workout workout, UserData userData)
 		{
-			switch (unit?.ToLower())
+			ushort? ftp = null;
+			if (workout?.Ftp_Info is object && workout.Ftp_Info.Ftp > 0)
 			{
-				case "km":
-					return DistanceUnit.Kilometers;
-				case "mi":
-					return DistanceUnit.Miles;
-				case "ft":
-					return DistanceUnit.Feet;
+				ftp = workout.Ftp_Info.Ftp;
+
+				if (workout.Ftp_Info.Ftp_Source == CyclingFtpSource.Ftp_Manual_Source)
+					ftp = (ushort)Math.Round(ftp.GetValueOrDefault() * .95);
+			} 
+			
+			if ((ftp is null || ftp <= 0) && userData is object)
+			{
+				if (userData.Cycling_Ftp_Source == CyclingFtpSource.Ftp_Manual_Source)
+					ftp = (ushort)Math.Round(userData.Cycling_Ftp * .95);
+
+				if (userData.Cycling_Ftp_Source == CyclingFtpSource.Ftp_Workout_Source)
+					ftp = userData.Cycling_Workout_Ftp;
+			}
+
+			if (ftp is null || ftp <= 0)
+			{
+				ftp = userData?.Estimated_Cycling_Ftp;
+			}
+
+			return ftp;
+		}
+
+		protected static Sport GetGarminSport(Workout workout)
+		{
+			var fitnessDiscipline = workout.Fitness_Discipline;
+			switch (fitnessDiscipline)
+			{
+				case FitnessDiscipline.Cycling:
+				case FitnessDiscipline.Bike_Bootcamp:
+					return Sport.Cycling;
+				case FitnessDiscipline.Running:
+					return Sport.Running;
+				case FitnessDiscipline.Walking:
+					return Sport.Walking;
+				case FitnessDiscipline.Cardio:
+				case FitnessDiscipline.Circuit:
+				case FitnessDiscipline.Strength:
+				case FitnessDiscipline.Stretching:
+				case FitnessDiscipline.Yoga:
+				case FitnessDiscipline.Meditation:
+					return Sport.Training;
+				case FitnessDiscipline.Caesar:
+					return Sport.Rowing;
 				default:
-					Log.Verbose("Found unkown distance unit {@Unit}", unit);
-					return DistanceUnit.Unknown;
+					return Sport.Invalid;
 			}
 		}
 	}

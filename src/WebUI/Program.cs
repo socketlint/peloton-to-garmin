@@ -6,32 +6,30 @@ using Serilog.Enrichers.Span;
 using Serilog.Events;
 using Prometheus;
 using Common.Observe;
-using OpenTelemetry.Trace;
-using OpenTelemetry.Resources;
 using Common.Stateful;
+using Common.Http;
 
 ///////////////////////////////////////////////////////////
 /// STATICS
 ///////////////////////////////////////////////////////////
+Statics.AppType = Constants.WebUIName;
 Statics.MetricPrefix = Constants.WebUIName;
 Statics.TracingService = Constants.WebUIName;
+Statics.ConfigPath = Path.Join(Environment.CurrentDirectory, "configuration.local.json");
 
 ///////////////////////////////////////////////////////////
 /// HOST
 ///////////////////////////////////////////////////////////
 var builder = WebApplication.CreateBuilder(args);
 
-var configProvider = builder.Configuration.AddJsonFile(Path.Join(Environment.CurrentDirectory, "configuration.local.json"), optional: true, reloadOnChange: true)
+var configProvider = builder.Configuration.AddJsonFile(Statics.ConfigPath, optional: true, reloadOnChange: true)
 				.AddEnvironmentVariables(prefix: "P2G_")
 				.AddCommandLine(args);
 
-var apiSettings = new ApiSettings();
-builder.Configuration.GetSection("Api").Bind(apiSettings);
-
 var config = new AppConfiguration();
-builder.Configuration.GetSection("Api").Bind(config.Api);
-builder.Configuration.GetSection(nameof(Observability)).Bind(config.Observability);
-builder.Configuration.GetSection(nameof(Developer)).Bind(config.Developer);
+ConfigurationSetup.LoadConfigValues(builder.Configuration, config);
+
+builder.WebHost.UseUrls(config.WebUI.HostUrl);
 
 builder.Host.UseSerilog((ctx, logConfig) =>
 {
@@ -45,41 +43,33 @@ builder.Host.UseSerilog((ctx, logConfig) =>
 /// SERVICES
 ///////////////////////////////////////////////////////////
 
-builder.Services.AddScoped<IApiClient>(sp => new ApiClient(apiSettings.HostUrl));
+builder.Services.AddScoped<IApiClient>(sp => new ApiClient(config.Api.HostUrl));
 builder.Services.AddHxServices();
+builder.Services.AddHxMessenger();
 
 // Add services to the container.
 builder.Services.AddRazorPages();
 builder.Services.AddServerSideBlazor();
 
 FlurlConfiguration.Configure(config.Observability, 30);
-Tracing.EnableTracing(builder.Services, config.Observability.Jaeger);
+Tracing.EnableWebUITracing(builder.Services, config.Observability.Jaeger);
 
 Log.Logger = new LoggerConfiguration()
 				.ReadFrom.Configuration(builder.Configuration, sectionName: $"{nameof(Observability)}:Serilog")
 				.Enrich.FromLogContext()
 				.CreateLogger();
 
-var runtimeVersion = Environment.Version.ToString();
-var os = Environment.OSVersion.Platform.ToString();
-var osVersion = Environment.OSVersion.VersionString;
-var version = Constants.AppVersion;
-
-Prometheus.Metrics.CreateGauge($"{Statics.MetricPrefix}_build_info", "Build info for the running instance.", new GaugeConfiguration()
-{
-	LabelNames = new[] { Common.Observe.Metrics.Label.Version, Common.Observe.Metrics.Label.Os, Common.Observe.Metrics.Label.OsVersion, Common.Observe.Metrics.Label.DotNetRuntime }
-}).WithLabels(version, os, osVersion, runtimeVersion)
-.Set(1);
-
-Log.Debug("P2G WebUI Version: {@Version}", version);
-Log.Debug("Operating System: {@Os}", osVersion);
-Log.Debug("DotNet Runtime: {@DotnetRuntime}", runtimeVersion);
+Logging.LogSystemInformation();
+Common.Observe.Metrics.CreateAppInfo();
 
 ///////////////////////////////////////////////////////////
 /// APP
 ///////////////////////////////////////////////////////////
 
 var app = builder.Build();
+
+// Setup initial Tracing Source
+Tracing.Source = new(Statics.TracingService);
 
 if (Log.IsEnabled(LogEventLevel.Verbose))
 	app.UseSerilogRequestLogging();

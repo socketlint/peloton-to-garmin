@@ -1,14 +1,17 @@
 ﻿using Common;
 using Common.Observe;
+using Common.Service;
 using Common.Stateful;
+using Core.GitHub;
 using Garmin;
+using Garmin.Auth;
 using Microsoft.Extensions.Hosting;
 using Peloton;
 using Prometheus;
 using Serilog;
 using Sync;
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using static Common.Observe.Metrics;
@@ -19,98 +22,152 @@ namespace PelotonToGarminConsole
 	internal class Startup : BackgroundService
 	{
 		private static readonly ILogger _logger = LogContext.ForClass<Startup>();
-		private static readonly Gauge BuildInfo = Prometheus.Metrics.CreateGauge("p2g_build_info", "Build info for the running instance.", new GaugeConfiguration()
-		{
-			LabelNames = new[] { Metrics.Label.Version, Metrics.Label.Os, Metrics.Label.OsVersion, Metrics.Label.DotNetRuntime }
-		});
 		private static readonly Gauge Health = Prometheus.Metrics.CreateGauge("p2g_health_info", "Health status for P2G.");
 		private static readonly Gauge NextSyncTime = Prometheus.Metrics.CreateGauge("p2g_next_sync_time", "The next time the sync will run in seconds since epoch.");
 
-		private readonly AppConfiguration _config;
-		private readonly Settings _settings;
+		private readonly ISettingsService _settingsService;
 		private readonly ISyncService _syncService;
+		private readonly IGitHubReleaseCheckService _githubService;
+		private readonly IGarminAuthenticationService _garminAuthService;
 
-		public Startup(AppConfiguration configuration, Settings settings, ISyncService syncService)
+		public Startup(ISettingsService settingsService, ISyncService syncService, IGitHubReleaseCheckService gitHubService, IGarminAuthenticationService garminAuthService)
 		{
-			_config = configuration;
-			_settings = settings;
+			_settingsService = settingsService;
 			_syncService = syncService;
+			_githubService = gitHubService;
 
-			FlurlConfiguration.Configure(_config.Observability);
-
-			var runtimeVersion = Environment.Version.ToString();
-			var os = Environment.OSVersion.Platform.ToString();
-			var osVersion = Environment.OSVersion.VersionString;
-			var version = Constants.AppVersion;
-
-			BuildInfo.WithLabels(version, os, osVersion, runtimeVersion).Set(1);
-			_logger.Debug("App Version: {@Version}", version);
-			_logger.Debug("Operating System: {@Os}", osVersion);
-			_logger.Debug("DotNet Runtime: {@DotnetRuntime}", runtimeVersion);
+			Logging.LogSystemInformation();
+			_garminAuthService = garminAuthService;
 		}
 
-		protected override Task ExecuteAsync(CancellationToken cancelToken)
+		protected override async Task ExecuteAsync(CancellationToken cancelToken)
 		{
 			_logger.Verbose("Begin.");
 
-			Health.Set(HealthStatus.Healthy);
+			var settings = await _settingsService.GetSettingsAsync();
+			var appConfig = await _settingsService.GetAppConfigurationAsync();
 
 			try
 			{
-				PelotonService.ValidateConfig(_settings.Peloton);
-				GarminUploader.ValidateConfig(_settings);
-				Metrics.ValidateConfig(_config.Observability);
-				Tracing.ValidateConfig(_config.Observability);
+				PelotonService.ValidateConfig(settings.Peloton);
+				GarminUploader.ValidateConfig(settings);
+				Metrics.ValidateConfig(appConfig.Observability);
+				Tracing.ValidateConfig(appConfig.Observability);
+
+				if (settings.App.CheckForUpdates)
+				{
+					var latestReleaseInformation = await _githubService.GetLatestReleaseInformationAsync("philosowaffle", "peloton-to-garmin", Constants.AppVersion);
+					if (latestReleaseInformation.IsReleaseNewerThanInstalledVersion)
+					{
+						_logger.Information("*********************************************");
+						_logger.Information("A new version is available: {@Version}", latestReleaseInformation.LatestVersion);
+						_logger.Information("Release Date: {@ReleaseDate}", latestReleaseInformation.ReleaseDate);
+						_logger.Information("Release Information: {@ReleaseUrl}", latestReleaseInformation.ReleaseUrl);
+						_logger.Information("*********************************************");
+
+						AppMetrics.SyncUpdateAvailableMetric(latestReleaseInformation.IsReleaseNewerThanInstalledVersion, latestReleaseInformation.LatestVersion);
+					}
+				}
 			}
 			catch (Exception ex)
 			{
-				_logger.Fatal(ex, "Exception during config validation.");
+				_logger.Error(ex, "Exception during config validation. Please modify your configuration.local.json and relaunch the application.");
 				Health.Set(HealthStatus.Dead);
+				if (!settings.App.CloseWindowOnFinish)
+					Console.ReadLine();
 				Environment.Exit(-1);
 			}
 
-			return RunAsync(cancelToken);
+			Health.Set(HealthStatus.Healthy);
+			await RunAsync(cancelToken);
 		}
 
 		private async Task RunAsync(CancellationToken cancelToken)
 		{
 			int exitCode = 0;
 
-			Statics.MetricPrefix = Constants.ConsoleAppName;
-			Statics.TracingService = Constants.ConsoleAppName;
+			var appConfig = await _settingsService.GetAppConfigurationAsync();
 
-			using var metrics = Metrics.EnableMetricsServer(_config.Observability.Prometheus);
-			using var metricsCollector = Metrics.EnableCollector(_config.Observability.Prometheus);
-			using var tracing = Tracing.EnableTracing(_config.Observability.Jaeger);
-			using var tracingSource = new ActivitySource("ROOT");
+			Log.Information("*********************************************");
+			using var metrics = Metrics.EnableMetricsServer(appConfig.Observability.Prometheus);
+			using var metricsCollector = Metrics.EnableCollector(appConfig.Observability.Prometheus);
+			using var tracing = Tracing.EnableConsoleTracing(appConfig.Observability.Jaeger);
+			Log.Information("*********************************************");
+
+			Tracing.Source = new(Statics.TracingService);
+			Metrics.CreateAppInfo();
+
+			var settings = await _settingsService.GetSettingsAsync();
 
 			try
 			{
-				if (_settings.Peloton.NumWorkoutsToDownload <= 0)
+				if (settings.Peloton.NumWorkoutsToDownload <= 0)
 				{
 					Console.Write("How many workouts to grab? ");
 					int num = Convert.ToInt32(Console.ReadLine());
-					_settings.Peloton.NumWorkoutsToDownload = num;
+					settings.Peloton.NumWorkoutsToDownload = num;
 				}
 
-				if (_settings.App.EnablePolling)
+				if (settings.App.EnablePolling)
 				{
-					while (_settings.App.EnablePolling && !cancelToken.IsCancellationRequested)
+					if (settings.Garmin.Upload && settings.Garmin.TwoStepVerificationEnabled && settings.App.EnablePolling)
 					{
-						var syncResult = await _syncService.SyncAsync(_settings.Peloton.NumWorkoutsToDownload);
+						_logger.Error("Polling cannot be enabled when Garmin TwoStepVerification is enabled.");
+						_logger.Information("Sync Service stopped.");
+						return;
+					}
+
+					while (!cancelToken.IsCancellationRequested)
+					{
+						settings = await _settingsService.GetSettingsAsync();
+
+						if (settings.App.CheckForUpdates)
+						{
+							var latestReleaseInformation = await _githubService.GetLatestReleaseInformationAsync("philosowaffle", "peloton-to-garmin", Constants.AppVersion);
+							if (latestReleaseInformation.IsReleaseNewerThanInstalledVersion)
+							{
+								_logger.Information("*********************************************");
+								_logger.Information("A new version is available: {@Version}", latestReleaseInformation.LatestVersion);
+								_logger.Information("Release Date: {@ReleaseDate}", latestReleaseInformation.ReleaseDate);
+								_logger.Information("Release Information: {@ReleaseUrl}", latestReleaseInformation.ReleaseUrl);
+								_logger.Information("*********************************************");
+
+								AppMetrics.SyncUpdateAvailableMetric(latestReleaseInformation.IsReleaseNewerThanInstalledVersion, latestReleaseInformation.LatestVersion);
+							}
+						}
+
+						var syncResult = await _syncService.SyncAsync(settings.Peloton.NumWorkoutsToDownload);
 						Health.Set(syncResult.SyncSuccess ? HealthStatus.Healthy : HealthStatus.UnHealthy);
 
-						Log.Information("Sleeping for {@Seconds} seconds...", _settings.App.PollingIntervalSeconds);
+						Log.Information("Done");
+						Log.Information("Sleeping for {@Seconds} seconds...", settings.App.PollingIntervalSeconds);
 
 						var now = DateTime.UtcNow;
-						var nextRunTime = now.AddSeconds(_settings.App.PollingIntervalSeconds);
+						var nextRunTime = now.AddSeconds(settings.App.PollingIntervalSeconds);
 						NextSyncTime.Set(new DateTimeOffset(nextRunTime).ToUnixTimeSeconds());
-						Thread.Sleep(_settings.App.PollingIntervalSeconds * 1000);
+						Thread.Sleep(settings.App.PollingIntervalSeconds * 1000);
 					}
 				} 
 				else
 				{
-					await _syncService.SyncAsync(_settings.Peloton.NumWorkoutsToDownload);
+					if (settings.Garmin.Upload && settings.Garmin.TwoStepVerificationEnabled)
+					{
+						await _garminAuthService.RefreshGarminAuthenticationAsync();
+						
+						Console.WriteLine("Detected Garmin Two Factor Enabled. Please check your email or phone for the Security Passcode sent by Garmin.");
+						var mfaCode = string.Empty;
+						var retryCount = 5;
+						while (retryCount > 0 && string.IsNullOrWhiteSpace(mfaCode))
+						{
+							Console.Write("Enter Code: ");
+							mfaCode = Console.ReadLine();
+							retryCount--;
+						}
+
+						await _garminAuthService.CompleteMFAAuthAsync(mfaCode);
+					}
+
+					await _syncService.SyncAsync(settings.Peloton.NumWorkoutsToDownload);
 				}
 
 				_logger.Information("Done.");
@@ -125,7 +182,7 @@ namespace PelotonToGarminConsole
 			{
 				_logger.Verbose("Exit.");
 
-				if (!_settings.App.CloseWindowOnFinish)
+				if (!settings.App.CloseWindowOnFinish)
 					Console.ReadLine();
 
 				Environment.Exit(exitCode);

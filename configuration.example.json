@@ -3,7 +3,8 @@
     "OutputDirectory": "./output",
     "EnablePolling": true,
     "PollingIntervalSeconds": 86400,
-    "CloseWindowOnFinish": false
+    "CloseWindowOnFinish": false,
+    "CheckForUpdates": true
   },
 
   "Format": {
@@ -26,6 +27,7 @@
   "Garmin": {
     "Email": "",
     "Password": "",
+    "TwoStepVerificationEnabled": false,
     "Upload": false,
     "FormatToUpload": "fit",
     "UploadStrategy": 2
@@ -46,7 +48,13 @@
 
     "Serilog": {
       "Using": [ "Serilog.Sinks.Console", "Serilog.Sinks.File" ],
-      "MinimumLevel": "Information",
+      "MinimumLevel": {
+        "Default": "Information",
+        "Override": {
+          "Microsoft": "Error",
+          "System": "Error"
+        }
+      },
       "WriteTo": [
         { "Name": "Console" },
         {

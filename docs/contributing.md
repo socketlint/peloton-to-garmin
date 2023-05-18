@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Contributing
-nav_order: 7
+nav_order: 8
 ---
 
 # Contributing
@@ -19,7 +19,7 @@ Ensure that your code:
 
 ## Development
 
-1. Install [dotent 5.0 runtime](https://dotnet.microsoft.com/download/dotnet/5.0/runtime)
+1. Install [dotent 6.0 runtime](https://dotnet.microsoft.com/download/dotnet/6.0/runtime)
 
 ```
 > dotnet restore

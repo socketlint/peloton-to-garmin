@@ -4,27 +4,26 @@ using Common.Dto.Garmin;
 using Common.Dto.Peloton;
 using Common.Helpers;
 using Common.Observe;
+using Common.Service;
 using Dynastream.Fit;
 using Serilog;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace Conversion
 {
 	public class FitConverter : Converter<Tuple<string, ICollection<Mesg>>>
 	{
-		private static readonly string _spaceSeparator = "_";
 		private static readonly ILogger _logger = LogContext.ForClass<FitConverter>();
-		public FitConverter(Settings settings, IFileHandling fileHandler) : base(settings, fileHandler) { }
-
-		public override ConvertStatus Convert(P2GWorkout workout)
+		public FitConverter(ISettingsService settings, IFileHandling fileHandler) : base(settings, fileHandler) 
 		{
-			if (!_config.Format.Fit) return new ConvertStatus() { Success = true, ErrorMessage = "Fit format disabled in config."};
-
-			return base.Convert(FileFormat.Fit, workout);
+			Format = FileFormat.Fit;
 		}
+
+		protected override bool ShouldConvert(Format settings) => settings.Fit;
 
 		protected override void Save(Tuple<string, ICollection<Mesg>> data, string path)
 		{
@@ -43,37 +42,28 @@ namespace Conversion
 				{
 					encoder.Close();
 				}
-
-				_logger.Information("[{@Format}] Encoded file {@Path}", FileFormat.Fit, fitDest.Name);
 			}
 		}
 
-		protected override void SaveLocalCopy(string sourcePath, string workoutTitle)
+		protected override async Task<Tuple<string, ICollection<Mesg>>> ConvertInternalAsync(P2GWorkout workoutData, Settings settings)
 		{
-			if (!_config.Format.Fit || !_config.Format.SaveLocalCopy) return;
-
-			_fileHandler.MkDirIfNotExists(_config.App.FitDirectory);
-
-			var backupDest = Path.Join(_config.App.FitDirectory, $"{workoutTitle}.fit");
-			_fileHandler.Copy(sourcePath, backupDest, overwrite: true);
-			_logger.Information("[{@Format}] Backed up file {@File}", FileFormat.Fit, backupDest);
-		}
-
-		protected override Tuple<string, ICollection<Mesg>> Convert(Workout workout, WorkoutSamples workoutSamples)
-		{
-			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(Convert)}")
+			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(ConvertAsync)}")
 										.WithTag(TagKey.Format, FileFormat.Fit.ToString())
-										.WithWorkoutId(workout.Id);
+										.WithWorkoutId(workoutData.Workout.Id);
+
+			var workout = workoutData.Workout;
+			var workoutSamples = workoutData.WorkoutSamples;
+			var userData = workoutData.UserData;
 
 			// MESSAGE ORDER MATTERS
 			var messages = new List<Mesg>();
 
 			var startTime = GetStartTimeUtc(workout);
-			var endTime = GetEndTimeUtc(workout);
+			var endTime = GetEndTimeUtc(workout, workoutSamples);
 			var title = WorkoutHelper.GetTitle(workout);
 			var sport = GetGarminSport(workout);
 			var subSport = GetGarminSubSport(workout);
-			var deviceInfo = GetDeviceInfo(workout.Fitness_Discipline);
+			var deviceInfo = await GetDeviceInfoAsync(workout.Fitness_Discipline, settings);
 
 			if (sport == Sport.Invalid)
 			{
@@ -110,14 +100,19 @@ namespace Conversion
 			messages.Add(sportMesg);
 
 			var zoneTargetMesg = new ZonesTargetMesg();
-			zoneTargetMesg.SetFunctionalThresholdPower((ushort)workout.Ftp_Info.Ftp);
-			zoneTargetMesg.SetPwrCalcType(PwrZoneCalc.PercentFtp);
+
+			if (sport == Sport.Cycling)
+			{
+				zoneTargetMesg.SetFunctionalThresholdPower(GetCyclingFtp(workout, userData));
+				zoneTargetMesg.SetPwrCalcType(PwrZoneCalc.PercentFtp);
+			}
+			
 			var maxHr = GetUserMaxHeartRate(workoutSamples);
 			if (maxHr is object)
 			{
 				zoneTargetMesg.SetMaxHeartRate(maxHr.Value);
 				zoneTargetMesg.SetHrCalcType(HrZoneCalc.PercentMaxHr);
-			}				
+			}
 			messages.Add(zoneTargetMesg);
 
 			var trainingMesg = new TrainingFileMesg();
@@ -129,45 +124,65 @@ namespace Conversion
 			trainingMesg.SetType(Dynastream.Fit.File.Workout);
 			messages.Add(trainingMesg);
 
-			AddMetrics(messages, workoutSamples, startTime);
-
-			var workoutSteps = new List<WorkoutStepMesg>();
-			var laps = new List<LapMesg>();
-			var preferredLapType = PreferredLapType.Default;
-
-			if (sport == Sport.Cycling)
-				preferredLapType = _config.Format.Cycling.PreferredLapType;
-			if (sport == Sport.Running)
-				preferredLapType = _config.Format.Running.PreferredLapType;
-
-			if ((preferredLapType == PreferredLapType.Class_Targets || preferredLapType == PreferredLapType.Default) 
-				&& workoutSamples.Target_Performance_Metrics?.Target_Graph_Metrics?.FirstOrDefault(w => w.Type == "cadence")?.Graph_Data is object)
-			{
-				var stepsAndLaps = GetWorkoutStepsAndLaps(workoutSamples, startTime, sport, subSport);
-				workoutSteps = stepsAndLaps.Values.Select(v => v.Item1).ToList();
-				laps = stepsAndLaps.Values.Select(v => v.Item2).ToList();
-			} else
-			{
-				laps = GetLaps(preferredLapType, workoutSamples, startTime, sport, subSport).ToList();
-			}	
+			AddMetrics(messages, workoutSamples, sport, startTime);
 
 			var workoutMesg = new WorkoutMesg();
-			workoutMesg.SetWktName(title.Replace(_spaceSeparator, " "));
+			workoutMesg.SetWktName(title.Replace(WorkoutHelper.SpaceSeparator, ' '));
 			workoutMesg.SetCapabilities(32);
 			workoutMesg.SetSport(sport);
 			workoutMesg.SetSubSport(subSport);
-			workoutMesg.SetNumValidSteps((ushort)workoutSteps.Count);
+
+			var lapCount = 0;
+
+			if (subSport == SubSport.StrengthTraining)
+			{
+				var sets = GetExerciseBasedSteps(workoutData.Exercises, startTime, settings);
+
+				// Add sets in order
+				foreach (var set in sets)
+					messages.Add(set);
+
+			} else
+			{
+				var workoutSteps = new List<WorkoutStepMesg>();
+				var laps = new List<LapMesg>();
+				var preferredLapType = PreferredLapType.Default;
+
+				if (sport == Sport.Cycling)
+					preferredLapType = settings.Format.Cycling.PreferredLapType;
+				if (sport == Sport.Running)
+					preferredLapType = settings.Format.Running.PreferredLapType;
+				if (sport == Sport.Rowing)
+					preferredLapType = settings.Format.Rowing.PreferredLapType;
+
+				if ((preferredLapType == PreferredLapType.Class_Targets || preferredLapType == PreferredLapType.Default)
+					&& workoutSamples.Target_Performance_Metrics?.Target_Graph_Metrics?.FirstOrDefault(w => w.Type == "cadence")?.Graph_Data is object)
+				{
+					var stepsAndLaps = GetWorkoutStepsAndLaps(workoutSamples, startTime, sport, subSport);
+					workoutSteps = stepsAndLaps.Values.Select(v => v.Item1).ToList();
+					laps = stepsAndLaps.Values.Select(v => v.Item2).ToList();
+				}
+				else
+				{
+					laps = GetLaps(preferredLapType, workoutSamples, startTime, sport, subSport).ToList();
+				}
+
+				workoutMesg.SetNumValidSteps((ushort)workoutSteps.Count);
+
+				// add steps in order
+				foreach (var step in workoutSteps)
+					messages.Add(step);
+
+				// Add laps in order
+				foreach (var lap in laps)
+					messages.Add(lap);
+
+				lapCount = laps.Count; 
+			}
+			
 			messages.Add(workoutMesg);
 
-			// add steps in order
-			foreach (var step in workoutSteps)
-				messages.Add(step);
-
-			// Add laps in order
-			foreach (var lap in laps)
-				messages.Add(lap);
-
-			messages.Add(GetSessionMesg(workout, workoutSamples, startTime, endTime, (ushort)laps.Count));
+			messages.Add(GetSessionMesg(workout, workoutSamples, userData, settings, sport, startTime, endTime, (ushort)lapCount));
 
 			var activityMesg = new ActivityMesg();
 			activityMesg.SetTimestamp(endTime);
@@ -177,7 +192,7 @@ namespace Conversion
 			activityMesg.SetEvent(Event.Activity);
 			activityMesg.SetEventType(EventType.Stop);
 
-			var timezoneOffset = (int)TimeZoneInfo.Local.GetUtcOffset(base.GetEndTimeUtc(workout)).TotalSeconds;
+			var timezoneOffset = (int)TimeZoneInfo.Local.GetUtcOffset(base.GetEndTimeUtc(workout, workoutSamples)).TotalSeconds;
 			var timeStamp = (uint)((int)endTime.GetTimeStamp() + timezoneOffset);
 			activityMesg.SetLocalTimestamp(timeStamp);
 
@@ -192,13 +207,13 @@ namespace Conversion
 			return new Dynastream.Fit.DateTime(dtDateTime);
 		}
 
-		private new Dynastream.Fit.DateTime GetEndTimeUtc(Workout workout)
+		private new Dynastream.Fit.DateTime GetEndTimeUtc(Workout workout, WorkoutSamples workoutSamples)
 		{
-			var dtDateTime = base.GetEndTimeUtc(workout);
+			var dtDateTime = base.GetEndTimeUtc(workout, workoutSamples);
 			return new Dynastream.Fit.DateTime(dtDateTime);
 		}
 
-		private Dynastream.Fit.DateTime AddMetrics(ICollection<Mesg> messages, WorkoutSamples workoutSamples, Dynastream.Fit.DateTime startTime)
+		private Dynastream.Fit.DateTime AddMetrics(ICollection<Mesg> messages, WorkoutSamples workoutSamples, Sport sport, Dynastream.Fit.DateTime startTime)
 		{
 			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(AddMetrics)}")
 										.WithTag(TagKey.Format, FileFormat.Fit.ToString());
@@ -206,8 +221,10 @@ namespace Conversion
 			var allMetrics = workoutSamples.Metrics;
 			var hrMetrics = allMetrics.FirstOrDefault(m => m.Slug == "heart_rate");
 			var outputMetrics = allMetrics.FirstOrDefault(m => m.Slug == "output");
-			var cadenceMetrics = allMetrics.FirstOrDefault(m => m.Slug == "cadence");
+
+			var cadenceMetrics = GetCadenceSummary(workoutSamples, sport);
 			var speedMetrics = GetSpeedSummary(workoutSamples);
+
 			var resistanceMetrics = allMetrics.FirstOrDefault(m => m.Slug == "resistance");
 			var inclineMetrics = GetGradeSummary(workoutSamples);
 			var locationMetrics = workoutSamples.Location_Data?.SelectMany(x => x.Coordinates).ToArray();
@@ -222,11 +239,11 @@ namespace Conversion
 					record.SetTimestamp(recordsTimeStamp);
 
 					if (speedMetrics is object && i < speedMetrics.Values.Length)
-						record.SetSpeed(ConvertToMetersPerSecond(speedMetrics.GetValue(i), workoutSamples));
+						record.SetSpeed(ConvertToMetersPerSecond(speedMetrics.GetValue(i), speedMetrics.Display_Unit));
 
 					if (hrMetrics is object && i < hrMetrics.Values.Length)
 						record.SetHeartRate((byte)hrMetrics.Values[i]);
-
+					
 					if (cadenceMetrics is object && i < cadenceMetrics.Values.Length)
 						record.SetCadence((byte)cadenceMetrics.Values[i]);
 
@@ -270,63 +287,55 @@ namespace Conversion
 			return (int)(degrees * (Math.Pow(2, 31) / 180));
 		}
 
-		private Sport GetGarminSport(Workout workout)
-		{
-			var fitnessDiscipline = workout.Fitness_Discipline;
-			switch (fitnessDiscipline)
-			{
-				case FitnessDiscipline.Cycling:
-				case FitnessDiscipline.Bike_Bootcamp:
-					return Sport.Cycling;
-				case FitnessDiscipline.Running:
-					return Sport.Running;
-				case FitnessDiscipline.Walking:
-					return Sport.Walking;
-				case FitnessDiscipline.Cardio:
-				case FitnessDiscipline.Circuit:
-				case FitnessDiscipline.Strength:
-				case FitnessDiscipline.Stretching:
-				case FitnessDiscipline.Yoga:
-				case FitnessDiscipline.Meditation:
-					return Sport.Training;
-				default:
-					return Sport.Invalid;
-			}
-		}
-
 		private SubSport GetGarminSubSport(Workout workout)
 		{
 			var fitnessDiscipline = workout.Fitness_Discipline;
 			switch (fitnessDiscipline)
 			{
+				case FitnessDiscipline.Running when workout.Is_Outdoor:
+				case FitnessDiscipline.Cycling when workout.Is_Outdoor:
+				case FitnessDiscipline.Walking when workout.Is_Outdoor:
+					return SubSport.Generic;
+
 				case FitnessDiscipline.Cycling:
 				case FitnessDiscipline.Bike_Bootcamp:
 					return SubSport.IndoorCycling;
+
 				case FitnessDiscipline.Running:
-					return SubSport.IndoorRunning;
 				case FitnessDiscipline.Walking:
-					return SubSport.IndoorWalking;
+					return SubSport.Treadmill;
+
 				case FitnessDiscipline.Cardio:
 				case FitnessDiscipline.Circuit:
 					return SubSport.CardioTraining;
+
 				case FitnessDiscipline.Strength:
 					return SubSport.StrengthTraining;
+
 				case FitnessDiscipline.Stretching:
 					return SubSport.FlexibilityTraining;
+
 				case FitnessDiscipline.Yoga:
 					return SubSport.Yoga;
+
 				case FitnessDiscipline.Meditation:
 					return SubSport.Breathing;
+
+				case FitnessDiscipline.Caesar:
+					return SubSport.IndoorRowing;
+
 				default:
 					return SubSport.Generic;
 			}
 		}
 
-		private SessionMesg GetSessionMesg(Workout workout, WorkoutSamples workoutSamples, Dynastream.Fit.DateTime startTime, Dynastream.Fit.DateTime endTime, ushort numLaps)
+		private SessionMesg GetSessionMesg(Workout workout, WorkoutSamples workoutSamples, UserData userData, Settings settings, Sport sport, Dynastream.Fit.DateTime startTime, Dynastream.Fit.DateTime endTime, ushort numLaps)
 		{
 			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(GetSessionMesg)}")
 										.WithTag(TagKey.Format, FileFormat.Fit.ToString())
 										.WithWorkoutId(workout.Id);
+
+			var totalDistance = GetTotalDistance(workoutSamples);
 
 			var sessionMesg = new SessionMesg();
 			sessionMesg.SetTimestamp(endTime);
@@ -334,7 +343,7 @@ namespace Conversion
 			var totalTime = workoutSamples.Duration;
 			sessionMesg.SetTotalElapsedTime(totalTime);
 			sessionMesg.SetTotalTimerTime(totalTime);
-			sessionMesg.SetTotalDistance(GetTotalDistance(workoutSamples));
+			sessionMesg.SetTotalDistance(totalDistance);
 			sessionMesg.SetTotalWork((uint)workout.Total_Work);
 			sessionMesg.SetTotalCalories((ushort?)GetCalorieSummary(workoutSamples)?.Value);
 
@@ -344,7 +353,7 @@ namespace Conversion
 
 			sessionMesg.SetFirstLapIndex(0);
 			sessionMesg.SetNumLaps(numLaps);
-			sessionMesg.SetThresholdPower((ushort)workout.Ftp_Info.Ftp);
+			sessionMesg.SetThresholdPower(GetCyclingFtp(workout, userData));
 			sessionMesg.SetEvent(Event.Lap);
 			sessionMesg.SetEventType(EventType.Stop);
 			sessionMesg.SetSport(GetGarminSport(workout));
@@ -354,7 +363,7 @@ namespace Conversion
 			sessionMesg.SetAvgHeartRate((byte?)hrSummary?.Average_Value);
 			sessionMesg.SetMaxHeartRate((byte?)hrSummary?.Max_Value);
 
-			var cadenceSummary = GetCadenceSummary(workoutSamples);
+			var cadenceSummary = GetCadenceSummary(workoutSamples, sport);
 			sessionMesg.SetAvgCadence((byte?)cadenceSummary?.Average_Value);
 			sessionMesg.SetMaxCadence((byte?)cadenceSummary?.Max_Value);
 
@@ -364,8 +373,19 @@ namespace Conversion
 			sessionMesg.SetMaxPosGrade(GetMaxGrade(workoutSamples));
 			sessionMesg.SetMaxNegGrade(0.0f);
 
+			if (sport == Sport.Rowing)
+			{
+				var strokeCountSummary = workoutSamples.Summaries.FirstOrDefault(m => m.Slug == "stroke_count");
+				if (strokeCountSummary is object && strokeCountSummary.Value > 0)
+				{
+					var totalStrokes = strokeCountSummary.Value;
+					sessionMesg.SetAvgStrokeDistance((float)totalDistance / (float)totalStrokes);
+					sessionMesg.SetTotalStrokes((uint)strokeCountSummary.Value);
+				}
+			}
+
 			// HR zones
-			if (_config.Format.IncludeTimeInHRZones && workoutSamples.Metrics.Any())
+			if (settings.Format.IncludeTimeInHRZones && workoutSamples.Metrics.Any())
 			{
 				var hrz1 = GetHeartRateZone(1, workoutSamples);
 				if (hrz1 is object)
@@ -389,7 +409,7 @@ namespace Conversion
 			}
 
 			// Power Zones
-			if (_config.Format.IncludeTimeInPowerZones && workoutSamples.Metrics.Any())
+			if (settings.Format.IncludeTimeInPowerZones && workoutSamples.Metrics.Any() && workout.Fitness_Discipline == FitnessDiscipline.Cycling)
 			{
 				var zones = GetTimeInPowerZones(workout, workoutSamples);
 				if (zones is object)
@@ -417,7 +437,7 @@ namespace Conversion
 			if (workoutSamples is null)
 				return stepsAndLaps;
 
-			var cadenceTargets = workoutSamples.Target_Performance_Metrics?.Target_Graph_Metrics?.FirstOrDefault(w => w.Type == "cadence")?.Graph_Data;
+			var cadenceTargets = GetCadenceTargets(workoutSamples);
 
 			if (cadenceTargets is null)
 				return stepsAndLaps;
@@ -438,7 +458,7 @@ namespace Conversion
 
 				if (speedMetrics is object && index < speedMetrics.Values.Length)
 				{
-					var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(index), workoutSamples);
+					var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(index), speedMetrics.Display_Unit);
 					lapDistanceInMeters += 1 * currentSpeedInMPS;
 				}
 
@@ -493,6 +513,74 @@ namespace Conversion
 			return stepsAndLaps;
 		}
 
+		private ICollection<SetMesg> GetExerciseBasedSteps(ICollection<P2GExercise> exercises, Dynastream.Fit.DateTime startTime, Settings settings)
+		{
+			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(GetExerciseBasedSteps)}")
+										.WithTag(TagKey.Format, FileFormat.Fit.ToString());
+
+			var steps = new List<SetMesg>();
+
+			if (exercises is null || exercises.Count <= 0)
+				return steps;
+
+			ushort stepIndex = 0;
+			foreach (var p2gExercise in exercises)
+			{
+				var isRest = p2gExercise.Id.IsRest();
+				GarminExercise exercise = null;
+				if (!isRest)
+				{
+					if (ExerciseMapping.IgnoredPelotonExercises.Contains(p2gExercise.Id))
+						continue;
+
+					if (!ExerciseMapping.StrengthExerciseMappings.TryGetValue(p2gExercise.Id, out exercise))
+					{
+						_logger.Information($"Found Peloton Strength exercise with no Garmin mapping: {p2gExercise.Name} {p2gExercise.Id}");
+						continue;
+					}
+				}
+
+				var setMesg = new SetMesg();
+				var setStartTime = new Dynastream.Fit.DateTime(startTime);
+				setStartTime.Add(p2gExercise.StartOffsetSeconds);
+				setMesg.SetStartTime(setStartTime);
+				setMesg.SetDuration(p2gExercise.DurationSeconds);
+
+				if (!isRest)
+				{
+					setMesg.SetCategory(0, exercise.ExerciseCategory);
+					setMesg.SetCategorySubtype(0, exercise.ExerciseName);
+				}
+
+				setMesg.SetMessageIndex(stepIndex);
+				setMesg.SetSetType(isRest ? SetType.Rest : SetType.Active);
+				setMesg.SetWktStepIndex(stepIndex);
+				
+				var reps = p2gExercise.Reps;
+				if (p2gExercise.Type == MovementTargetType.Time)
+				{
+					if (reps > 0)
+						reps = reps / settings.Format.Strength.DefaultSecondsPerRep;
+
+					if (reps is null)
+						reps = p2gExercise.DurationSeconds / settings.Format.Strength.DefaultSecondsPerRep;
+				}
+					
+
+				setMesg.SetRepetitions((ushort)reps);
+
+				if (p2gExercise.Weight is object)
+				{
+					setMesg.SetWeight(ConvertWeightToKilograms(p2gExercise.Weight.Value, p2gExercise.Weight.Unit));
+				}
+
+				stepIndex++;
+				steps.Add(setMesg);
+			}
+
+			return steps;
+		}
+
 		public ICollection<LapMesg> GetLaps(PreferredLapType preferredLapType, WorkoutSamples workoutSamples, Dynastream.Fit.DateTime startTime, Sport sport, SubSport subSport)
 		{
 			using var tracing = Tracing.Trace($"{nameof(FitConverter)}.{nameof(GetLaps)}")
@@ -517,6 +605,7 @@ namespace Conversion
 
 			ushort stepIndex = 0;
 			var speedMetrics = GetSpeedSummary(workoutSamples);
+			var cadenceMetrics = GetCadenceSummary(workoutSamples, sport);
 			if (workoutSamples.Segment_List.Any())
 			{
 				var totalElapsedTime = 0;
@@ -531,7 +620,7 @@ namespace Conversion
 					lapMesg.SetStartTime(lapStartTime);
 					lapMesg.SetMessageIndex(stepIndex);
 					lapMesg.SetEvent(Event.Lap);
-					lapMesg.SetLapTrigger(LapTrigger.Time);
+					lapMesg.SetLapTrigger(LapTrigger.SessionEnd);
 					lapMesg.SetSport(sport);
 					lapMesg.SetSubSport(subSport);
 
@@ -541,16 +630,32 @@ namespace Conversion
 					var startIndex = segment.Start_Time_Offset;
 					var endIndex = segment.Start_Time_Offset + segment.Length;
 					var lapDistanceInMeters = 0f;
+					double cadenceSumOverSeconds = 0;
+					double maxCadence = 0;
 					for (int i = startIndex; i < endIndex; i++)
 					{
 						if (speedMetrics is object && i < speedMetrics.Values.Length)
 						{
-							var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(i), workoutSamples);
+							var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(i), speedMetrics.Display_Unit);
 							lapDistanceInMeters += 1 * currentSpeedInMPS;
+						}
+
+						if (cadenceMetrics is object && i < cadenceMetrics.Values.Length)
+						{
+							var currentCadence = cadenceMetrics.GetValue(i);
+							cadenceSumOverSeconds += currentCadence;
+							maxCadence = currentCadence > maxCadence ? currentCadence : maxCadence;
 						}
 					}
 
 					lapMesg.SetTotalDistance(lapDistanceInMeters);
+
+					if (cadenceMetrics is object)
+					{
+						lapMesg.SetAvgCadence((byte)Math.Min(cadenceSumOverSeconds / segment.Length, 255));
+						lapMesg.SetMaxCadence((byte)Math.Min(maxCadence, 255));
+					}
+					
 					stepsAndLaps.Add(lapMesg);
 
 					stepIndex++;
@@ -574,21 +679,26 @@ namespace Conversion
 			if (speedMetrics is null)
 				return stepsAndLaps;
 
-			var speedUnit = GetDistanceUnit(speedMetrics?.Display_Unit);
+			var cadenceMetrics = GetCadenceSummary(workoutSamples, sport);
+
+			var speedUnit = UnitHelpers.GetSpeedUnit(speedMetrics?.Display_Unit);
 			var lapMeters = 0;
 			switch (speedUnit)
 			{
-				case DistanceUnit.Kilometers: lapMeters = 1000; break;
+				case SpeedUnit.KilometersPerHour: lapMeters = 1000; break;
+				case SpeedUnit.MinutesPer500Meters: lapMeters = 500; break;
 				default: lapMeters = 1600; break;
 			}
 
 			LapMesg lap = null;
-			ushort stepIndex = 0;			
+			ushort stepIndex = 0;
 			var lapDistanceInMeters = 0f;
 			float lapLengthSeconds = 0;
+			double cadenceSumOverSeconds = 0;
+			double maxCadence = 0;
 
 			for (var secondsSinceStart = 0; secondsSinceStart < speedMetrics.Values.Length; secondsSinceStart++)
-			{	
+			{
 				if (lap is null || lap.GetTotalElapsedTime() is not null)
 				{
 					// Start new Lap
@@ -599,26 +709,43 @@ namespace Conversion
 					lap.SetStartTime(lapStartTime);
 					lap.SetMessageIndex(stepIndex);
 					lap.SetEvent(Event.Lap);
-					lap.SetLapTrigger(LapTrigger.Time);
+					lap.SetLapTrigger(LapTrigger.Distance);
 					lap.SetSport(sport);
 					lap.SetSubSport(subSport);
 
 					lapLengthSeconds = 0;
 					lapDistanceInMeters = 0f;
+					cadenceSumOverSeconds = 0;
+					maxCadence = 0;
 				}
 
-				var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(secondsSinceStart), workoutSamples);
-				lapDistanceInMeters += 1 * currentSpeedInMPS;
 				lapLengthSeconds++;
+
+				var currentSpeedInMPS = ConvertToMetersPerSecond(speedMetrics.GetValue(secondsSinceStart), speedMetrics.Display_Unit);
+				lapDistanceInMeters += 1* currentSpeedInMPS;
+
+				if (cadenceMetrics is object && cadenceMetrics.Values.Length > secondsSinceStart)
+				{
+					var currentCadence = cadenceMetrics.GetValue(secondsSinceStart);
+					cadenceSumOverSeconds += currentCadence;
+					maxCadence = currentCadence > maxCadence ? currentCadence : maxCadence;
+				}
 
 				if (lapDistanceInMeters >= lapMeters || secondsSinceStart == speedMetrics.Values.Length - 1)
 				{
 					lap.SetTotalElapsedTime(lapLengthSeconds);
 					lap.SetTotalTimerTime(lapLengthSeconds);
 					lap.SetTotalDistance(lapDistanceInMeters);
+
+					if (cadenceMetrics is object)
+					{
+						lap.SetAvgCadence((byte)Math.Min(cadenceSumOverSeconds / lapLengthSeconds, 255));
+						lap.SetMaxCadence((byte)Math.Min(maxCadence, 255));
+					}
+
 					stepsAndLaps.Add(lap);
 					stepIndex++;
-				}				
+				}
 			}
 
 			return stepsAndLaps;
