@@ -3,5 +3,26 @@
 
 ## Fixes
 
-- [#552] fix ArgumentNullException in SyncService when no recent workouts found
-- [#548] GithubAction - workflow_dispatch boolean inputs are not actually booleans (@philjn)
+- [#683] Initial fix for Garmin Upload error.  Additionally introduces new settings for configuring Garmin Api.
+
+> [!CAUTION]
+> **Windows App Users**
+> When editing settings, you may encounter an issue where your mouse stops working within the P2G app.  Keyboard navigation continues to work.  If this happens, quit P2G and restart.  I will be investigating how to get a proper fix for this on a future release.
+
+## Docker Tags
+
+- Console
+    - `console-stable`
+    - `console-latest`
+    - `console-v4.3.1`
+    - `console-v4`
+- Api
+    - `api-stable`
+    - `api-latest`
+    - `api-v4.3.1`
+    - `api-v4`
+- WebUI
+    - `webui-stable`
+    - `webui-latest`
+    - `webui-v4.3.1`
+    - `webui-v4`
