@@ -17,14 +17,13 @@ on:
 
 jobs:
   sync:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # The type of runner that the job will run on
     container: 
       image:  philosowaffle/peloton-to-garmin:console-stable
     steps:
     - name: Set env
-      env:
-        ACTIONS_STEP_DEBUG: true
+      shell: bash
       run: echo "OUTPUT_DIR=/app/output" >> $GITHUB_ENV
     - run: mkdir -p ${{ env.OUTPUT_DIR }}
     - name: Create config file
