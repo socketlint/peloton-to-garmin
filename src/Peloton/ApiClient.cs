@@ -1,5 +1,4 @@
 ﻿using Common.Dto.Peloton;
-using Common.Http;
 using Common.Observe;
 using Common.Service;
 using Common.Stateful;
@@ -21,7 +20,7 @@ namespace Peloton
 		Task<PelotonResponse<Workout>> GetWorkoutsAsync(DateTime fromUtc, DateTime toUtc);
 		Task<Workout> GetWorkoutByIdAsync(string id);
 		Task<WorkoutSamples> GetWorkoutSamplesByIdAsync(string id);
-		Task<UserData> GetUserDataAsync();
+		Task<UserData> GetUserDataAsync(string sessionId = null, string bearerToken = null);
 		Task<PelotonChallenges> GetJoinedChallengesAsync(int userId);
 		Task<PelotonUserChallengeDetail> GetUserChallengeDetailsAsync(int userId, string challengeId);
 		Task<RideSegments> GetClassSegmentsAsync(string rideId);
@@ -31,7 +30,7 @@ namespace Peloton
 	{
 		private static readonly ILogger _logger = LogContext.ForClass<ApiClient>();
 		private static readonly string BaseUrl = "https://api.onepeloton.com/api";
-		private static readonly string AuthBaseUrl = "https://api.onepeloton.com/auth/login";
+		private static readonly string AuthBaseUrl = "https://api.onepeloton.com/auth/login?=";
 
 		private readonly ISettingsService _settingsService;
 
@@ -46,6 +45,30 @@ namespace Peloton
 
 			settings.Peloton.EnsurePelotonCredentialsAreProvided();
 
+			if (!string.IsNullOrWhiteSpace(settings.Peloton.SessionId))
+            {
+				var userProvidedAuth = new PelotonApiAuthentication()
+				{
+					SessionId = settings.Peloton.SessionId
+				};
+
+				var userData = await GetUserDataAsync(userProvidedAuth.SessionId);
+				userProvidedAuth.UserId = userData.Id;
+				return userProvidedAuth;
+            }
+
+			if (!string.IsNullOrWhiteSpace(settings.Peloton.BearerToken))
+            {
+                var userProvidedAuth = new PelotonApiAuthentication()
+				{
+					BearerToken = settings.Peloton.BearerToken
+				};
+
+				var userData = await GetUserDataAsync(sessionId: "", bearerToken: userProvidedAuth.BearerToken);
+				userProvidedAuth.UserId = userData.Id;
+				return userProvidedAuth;
+            }
+
 			var auth = _settingsService.GetPelotonApiAuthentication(settings.Peloton.Email);
 			if (auth is object && auth.IsValid(settings))
 				return auth;
@@ -59,7 +82,6 @@ namespace Peloton
 				var response = await $"{AuthBaseUrl}"
 				.WithHeader("Accept-Language", "en-US")
 				.WithHeader("User-Agent", overrideUserAgent ?? "PostmanRuntime/7.26.20")
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.WithTimeout(30)
 				.PostJsonAsync(new AuthRequest()
 				{
@@ -93,6 +115,7 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/user/{auth.UserId}/workouts"
 			.WithCookie("peloton_session_id", auth.SessionId)
+			.WithOAuthBearerToken(auth.BearerToken)
 			.WithCommonHeaders()
 			.SetQueryParams(new
 			{
@@ -101,7 +124,6 @@ namespace Peloton
 				page = page,
 				joins= "ride,ride.instructor"
 			})
-			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 			.GetJsonAsync<PagedPelotonResponse<Workout>>();
 		}
 
@@ -110,6 +132,7 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/user/{auth.UserId}/workouts"
 			.WithCookie("peloton_session_id", auth.SessionId)
+			.WithOAuthBearerToken(auth.BearerToken)
 			.WithCommonHeaders()
 			.SetQueryParams(new
 			{
@@ -118,18 +141,18 @@ namespace Peloton
 				sort_by = "-created",
 				joins = "ride"
 			})
-			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 			.GetJsonAsync<PelotonResponse<Workout>>();
 		}
 
 		/// <summary>
-		/// For ad hoc testing.
+		/// For ad hoc testing and contract discovery.
 		/// </summary>
-		public async Task<JObject> GetWorkoutsAsync(string userId, int numWorkouts, int page)
+		public async Task<string> GetRawWorkoutsAsync(string userId, int numWorkouts, int page)
 		{
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/user/{userId}/workouts"
 			.WithCookie("peloton_session_id", auth.SessionId)
+			.WithOAuthBearerToken(auth.BearerToken)
 			.WithCommonHeaders()
 			.SetQueryParams(new
 			{
@@ -138,17 +161,64 @@ namespace Peloton
 				page = page,
 				joins = "ride"
 			})
-			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
-			.GetJsonAsync<JObject>();
+			.GetStringAsync();
 		}
 
-		public async Task<UserData> GetUserDataAsync()
+		/// <summary>
+		/// For ad hoc testing and contract discovery.
+		/// </summary>
+		public async Task<string> GetRawWorkoutByIdAsync(string id)
 		{
 			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/workout/{id}"
+				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
+				.WithCommonHeaders()
+				.SetQueryParams(new
+				{
+					joins = "ride,ride.instructor"
+				})
+				.GetStringAsync();
+		}
+
+		/// <summary>
+		/// For ad hoc testing and contract discovery.
+		/// </summary>
+		public async Task<string> GetRawWorkoutSamplesByIdAsync(string id)
+		{
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/workout/{id}/performance_graph"
+				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
+				.WithCommonHeaders()
+				.SetQueryParams(new
+				{
+					every_n = 1
+				})
+				.GetStringAsync();
+		}
+
+		/// <summary>
+		/// For ad hoc testing and contract discovery.
+		/// </summary>
+		public async Task<string> GetRawClassSegmentsAsync(string rideId)
+		{
+			var auth = await GetAuthAsync();
+			return await $"{BaseUrl}/ride/{rideId}/details"
+				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
+				.WithCommonHeaders()
+				.GetStringAsync();
+		}
+
+		public async Task<UserData> GetUserDataAsync(string sessionId = null, string bearerToken = null)
+		{
+			var sid = sessionId ?? (await GetAuthAsync()).SessionId;
+			var bearer = bearerToken ?? (await GetAuthAsync()).BearerToken;
 			return await $"{BaseUrl}/me"
-			.WithCookie("peloton_session_id", auth.SessionId)
+			.WithCookie("peloton_session_id", sid)
+			.WithOAuthBearerToken(bearer)
 			.WithCommonHeaders()
-			.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 			.GetJsonAsync<UserData>();
 		}
 
@@ -157,12 +227,12 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/workout/{id}"
 				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
 				.WithCommonHeaders()
 				.SetQueryParams(new
 				{
 					joins = "ride,ride.instructor"
 				})
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<Workout>();
 		}
 
@@ -171,12 +241,12 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/workout/{id}/performance_graph"
 				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
 				.WithCommonHeaders()
 				.SetQueryParams(new
 				{
 					every_n=1
 				})
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<WorkoutSamples>();
 		}
 
@@ -185,12 +255,12 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/user/{auth.UserId}/challenges/current"
 				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
 				.WithCommonHeaders()
 				.SetQueryParams(new
 				{
 					has_joined = true
 				})
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<PelotonChallenges>();
 		}
 
@@ -199,8 +269,8 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/user/{auth.UserId}/challenge/{challengeId}"
 				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
 				.WithCommonHeaders()
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<PelotonUserChallengeDetail>();
 		}
 
@@ -209,9 +279,10 @@ namespace Peloton
 			var auth = await GetAuthAsync();
 			return await $"{BaseUrl}/ride/{rideId}/details"
 				.WithCookie("peloton_session_id", auth.SessionId)
+				.WithOAuthBearerToken(auth.BearerToken)
 				.WithCommonHeaders()
-				.StripSensitiveDataFromLogging(auth.Email, auth.Password)
 				.GetJsonAsync<RideSegments>();
 		}
 	}
 }
+

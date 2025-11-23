@@ -1,6 +1,5 @@
 ﻿using Common.Dto.Garmin;
 using Common.Stateful;
-using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json.Serialization;
@@ -38,8 +37,9 @@ public class App
 	public bool EnablePolling { get; set; }
 	public int PollingIntervalSeconds { get; set; }
 	public bool CheckForUpdates { get; set; }
+	public bool CloseConsoleOnFinish { get; set; } = false;
 
-	public static string DataDirectory => Path.GetFullPath(Path.Join(Statics.DefaultDataDirectory, "data"));
+	public static string DataDirectory => Statics.DefaultDataDirectory;
 
 	public string WorkingDirectory => Statics.DefaultTempDirectory;
 	public string OutputDirectory => Statics.DefaultOutputDirectory;
@@ -74,14 +74,30 @@ public class Format
 	public bool SaveLocalCopy { get; set; }
 	public bool IncludeTimeInHRZones { get; set; }
 	public bool IncludeTimeInPowerZones { get; set; }
-	[Obsolete("Use DeviceInfoSettings instead.  Will be removed in P2G v5.")]
-	public string DeviceInfoPath { get; set; }
 	public Dictionary<WorkoutType, GarminDeviceInfo> DeviceInfoSettings { get; set; }
 	public string WorkoutTitleTemplate { get; set; } = "{{PelotonWorkoutTitle}}{{#if PelotonInstructorName}} with {{PelotonInstructorName}}{{/if}}";
 	public Cycling Cycling { get; set; }
 	public Running Running { get; set; }
 	public Rowing Rowing { get; init; }
 	public Strength Strength { get; init; }
+	public StackedWorkoutsSettings StackedWorkouts { get; init; } = new StackedWorkoutsSettings();
+}
+
+public record StackedWorkoutsSettings
+{
+	/// <summary>
+	/// True if P2G should automatically detect and stack workouts when
+	/// converting and syncing.  P2G will only stack workouts of the same type
+	/// and only within a default time gap of 5min.
+	/// </summary>
+	public bool AutomaticallyStackWorkouts { get; set; } = false;
+
+	/// <summary>
+	/// The maximum amount of time allowed between workouts that should be stacked.
+	/// If the gap of time is larger than this, then the workouts will not be stacked.
+	/// The default is 5min.
+	/// </summary>
+	public long MaxAllowedGapSeconds { get; set; } = 300;
 }
 
 public record Cycling
@@ -129,6 +145,8 @@ public class PelotonSettings : ICredentials
 	public EncryptionVersion EncryptionVersion { get; set; }
 	public string Email { get; set; }
 	public string Password { get; set; }
+	public string SessionId { get; set; }
+	public string BearerToken { get; set; }
 	public int NumWorkoutsToDownload { get; set; }
 	public ICollection<WorkoutType> ExcludeWorkoutTypes { get; set; }
 }

@@ -1,28 +1,28 @@
 [![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/philosowaffle) <span class="badge-buymeacoffee"><a href="https://www.buymeacoffee.com/philosowaffle" title="Donate to this project using Buy Me A Coffee"><img src="https://img.shields.io/badge/buy%20me%20a%20coffee-donate-yellow.svg" alt="Buy Me A Coffee donate button" /></a></span>
 ---
 
-## Fixes
+> [!TIP]
+> You can find specific Upgrade Instructions by visitng the [Install Page](https://philosowaffle.github.io/peloton-to-garmin/latest/install/) for your particular flavor of P2G and looking for the section titled `⬆️ Updating`.
 
-- [#683] Initial fix for Garmin Upload error.  Additionally introduces new settings for configuring Garmin Api.
+## Features
 
-> [!CAUTION]
-> **Windows App Users**
-> When editing settings, you may encounter an issue where your mouse stops working within the P2G app.  Keyboard navigation continues to work.  If this happens, quit P2G and restart.  I will be investigating how to get a proper fix for this on a future release.
+- [#795] Add ability to provide Peloton Bearer Token via config file (@eRaid6)
 
 ## Docker Tags
 
 - Console
     - `console-stable`
     - `console-latest`
-    - `console-v4.3.1`
-    - `console-v4`
+    - `console-v5.2.0`
+    - `console-v5`
+
 - Api
     - `api-stable`
     - `api-latest`
-    - `api-v4.3.1`
-    - `api-v4`
+    - `api-v5.2.0`
+    - `api-v5`
 - WebUI
     - `webui-stable`
     - `webui-latest`
-    - `webui-v4.3.1`
-    - `webui-v4`
+    - `webui-v5.2.0`
+    - `webui-v5`
