@@ -16,8 +16,8 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     # The type of runner that the job will run on
-    container: 
-      image:  philosowaffle/peloton-to-garmin:stable
+    container:
+      image:  philosowaffle/peloton-to-garmin:latest
     steps:
     - run: mkdir -p /app/output
     - name: Create device info file
