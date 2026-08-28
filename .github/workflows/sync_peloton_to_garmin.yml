@@ -14,14 +14,14 @@ on:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     # The type of runner that the job will run on
     container:
       image:  philosowaffle/peloton-to-garmin:console-latest
     steps:
     - run: mkdir -p /app/output
     - name: Create device info file
-      env: 
+      env:
         DEVICE_INFO: ${{ secrets.DEVICE_INFO }}
       if: ${{ env.DEVICE_INFO }}
       run: |
@@ -32,7 +32,7 @@ jobs:
       env:
         DEFAULT_WORKOUT_NUM: 5
       run: |
-        cat <<EOT > /app/configuration.local.json 
+        cat <<EOT > /app/configuration.local.json
         {
           "App": {
             "OutputDirectory": "/app/output",
