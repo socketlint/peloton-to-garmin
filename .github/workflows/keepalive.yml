@@ -1,0 +1,24 @@
+# Keeps the scheduled sync workflow from being auto-disabled by GitHub after
+# 60 days of repository inactivity. Runs monthly on GitHub-hosted runners.
+name: Keep sync workflow alive
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 1 * *'
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-enable workflows (resets the inactivity timer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow enable sync_peloton_to_garmin.yml
+          gh workflow enable keepalive.yml
+          gh workflow list --all
